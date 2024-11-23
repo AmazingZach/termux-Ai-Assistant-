@@ -1,0 +1,331 @@
+import numpy as np
+import subprocess
+import json
+import os
+from typing import List, Dict, Tuple
+from datetime import datetime
+import re
+
+class TermuxDataCollector:
+    """Collects training data from Termux system."""
+    
+    def __init__(self):
+        self.command_cache_file = os.path.expanduser('~/.termux_llm/command_cache.json')
+        self.package_cache_file = os.path.expanduser('~/.termux_llm/package_cache.json')
+        os.makedirs(os.path.dirname(self.command_cache_file), exist_ok=True)
+    
+    def collect_command_data(self) -> List[Dict]:
+        """Collect command information and man pages."""
+        commands_data = []
+        
+        # Get list of available commands
+        try:
+            result = subprocess.run(['compgen', '-c'], 
+                                 capture_output=True, 
+                                 text=True,
+                                 shell=True)
+            commands = set(result.stdout.split('\n'))
+            
+            # Process each command
+            for cmd in commands:
+                if cmd:
+                    cmd_data = self._get_command_info(cmd)
+                    if cmd_data:
+                        commands_data.append(cmd_data)
+            
+            # Cache the data
+            self._cache_data(self.command_cache_file, commands_data)
+            
+        except Exception as e:
+            print(f"Error collecting command data: {e}")
+            # Try to load from cache
+            commands_data = self._load_cache(self.command_cache_file)
+        
+        return commands_data
+    
+    def collect_package_data(self) -> List[Dict]:
+        """Collect package information."""
+        packages_data = []
+        
+        try:
+            # Get installed packages
+            result = subprocess.run(['pkg', 'list-installed'],
+                                 capture_output=True,
+                                 text=True)
+            installed = result.stdout.split('\n')
+            
+            # Get available packages
+            result = subprocess.run(['pkg', 'list-all'],
+                                 capture_output=True,
+                                 text=True)
+            available = result.stdout.split('\n')
+            
+            # Process package information
+            for pkg_line in available:
+                if pkg_line:
+                    pkg_data = self._parse_package_info(pkg_line, pkg_line in installed)
+                    if pkg_data:
+                        packages_data.append(pkg_data)
+            
+            # Cache the data
+            self._cache_data(self.package_cache_file, packages_data)
+            
+        except Exception as e:
+            print(f"Error collecting package data: {e}")
+            # Try to load from cache
+            packages_data = self._load_cache(self.package_cache_file)
+        
+        return packages_data
+    
+    def _get_command_info(self, cmd: str) -> Dict:
+        """Get detailed information about a command."""
+        try:
+            # Try to get man page
+            man_result = subprocess.run(['man', cmd],
+                                     capture_output=True,
+                                     text=True)
+            man_text = man_result.stdout
+            
+            # Try to get help text
+            help_result = subprocess.run([cmd, '--help'],
+                                       capture_output=True,
+                                       text=True)
+            help_text = help_result.stdout
+            
+            return {
+                'command': cmd,
+                'man_page': man_text,
+                'help_text': help_text,
+                'timestamp': datetime.now().isoformat()
+            }
+        except:
+            return None
+    
+    def _parse_package_info(self, pkg_line: str, installed: bool) -> Dict:
+        """Parse package information from pkg list output."""
+        try:
+            # Extract package name and version
+            match = re.match(r'([^\s]+)\s+([^\s]+)', pkg_line)
+            if match:
+                name, version = match.groups()
+                
+                # Get package description
+                desc_result = subprocess.run(['pkg', 'show', name],
+                                          capture_output=True,
+                                          text=True)
+                
+                return {
+                    'name': name,
+                    'version': version,
+                    'installed': installed,
+                    'description': desc_result.stdout,
+                    'timestamp': datetime.now().isoformat()
+                }
+        except:
+            return None
+    
+    def _cache_data(self, cache_file: str, data: List[Dict]) -> None:
+        """Cache collected data to file."""
+        try:
+            with open(cache_file, 'w') as f:
+                json.dump(data, f)
+        except Exception as e:
+            print(f"Error caching data: {e}")
+    
+    def _load_cache(self, cache_file: str) -> List[Dict]:
+        """Load data from cache file."""
+        try:
+            with open(cache_file, 'r') as f:
+                return json.load(f)
+        except:
+            return []
+
+class TermuxDataProcessor:
+    """Processes collected Termux data for training."""
+    
+    def __init__(self, tokenizer, max_seq_length: int = 512):
+        self.tokenizer = tokenizer
+        self.max_seq_length = max_seq_length
+    
+    def prepare_training_data(self, commands_data: List[Dict], 
+                            packages_data: List[Dict]) -> Tuple[np.ndarray, np.ndarray]:
+        """Prepare training data from collected information."""
+        training_pairs = []
+        
+        # Process command data
+        for cmd in commands_data:
+            # Command usage examples
+            training_pairs.extend([
+                (f"How do I use the {cmd['command']} command?",
+                 self._extract_usage(cmd['help_text'])),
+                (f"What is the purpose of {cmd['command']}?",
+                 self._extract_description(cmd['man_page'])),
+                (f"Show me examples of {cmd['command']}",
+                 self._extract_examples(cmd['man_page'], cmd['help_text']))
+            ])
+        
+        # Process package data
+        for pkg in packages_data:
+            # Package information examples
+            training_pairs.extend([
+                (f"What is the {pkg['name']} package?",
+                 pkg['description']),
+                (f"How do I install {pkg['name']}?",
+                 f"You can install {pkg['name']} using: pkg install {pkg['name']}"),
+                (f"Is {pkg['name']} installed?",
+                 f"{'Yes' if pkg['installed'] else 'No'}, {pkg['name']} {'is' if pkg['installed'] else 'is not'} installed.")
+            ])
+        
+        # Convert to model inputs
+        inputs = []
+        targets = []
+        
+        for question, answer in training_pairs:
+            # Tokenize and pad sequences
+            input_ids = self._prepare_sequence(question)
+            target_ids = self._prepare_sequence(answer)
+            
+            if input_ids is not None and target_ids is not None:
+                inputs.append(input_ids)
+                targets.append(target_ids)
+        
+        return np.array(inputs), np.array(targets)
+    
+    def _prepare_sequence(self, text: str) -> np.ndarray:
+        """Tokenize and pad sequence."""
+        try:
+            tokens = self.tokenizer.encode(text)
+            if len(tokens) > self.max_seq_length:
+                tokens = tokens[:self.max_seq_length]
+            else:
+                tokens = np.pad(tokens, 
+                              (0, self.max_seq_length - len(tokens)),
+                              'constant',
+                              constant_values=self.tokenizer.token_to_id[self.tokenizer.pad_token])
+            return tokens
+        except:
+            return None
+    
+    def _extract_usage(self, help_text: str) -> str:
+        """Extract usage information from help text."""
+        # Simple extraction of the first few lines
+        lines = help_text.split('\n')
+        usage_lines = [line for line in lines[:5] if line.strip()]
+        return ' '.join(usage_lines)
+    
+    def _extract_description(self, man_text: str) -> str:
+        """Extract description from man page."""
+        # Try to find description section
+        match = re.search(r'DESCRIPTION\n(.*?)\n\n', man_text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        return man_text.split('\n')[2] if len(man_text.split('\n')) > 2 else man_text
+    
+    def _extract_examples(self, man_text: str, help_text: str) -> str:
+        """Extract examples from documentation."""
+        examples = []
+        
+        # Try to find examples in man page
+        match = re.search(r'EXAMPLES\n(.*?)\n\n', man_text, re.DOTALL)
+        if match:
+            examples.append(match.group(1).strip())
+        
+        # Look for example usage in help text
+        help_lines = help_text.split('\n')
+        for i, line in enumerate(help_lines):
+            if 'example' in line.lower():
+                examples.extend(help_lines[i:i+3])
+        
+        return '\n'.join(examples) if examples else "No examples available."
+
+def train_on_termux_data(model, epochs: int = 10, batch_size: int = 32):
+    """Train the LLM on Termux data."""
+    # Initialize data collector and processor
+    collector = TermuxDataCollector()
+    processor = TermuxDataProcessor(model.tokenizer)
+    
+    # Collect data
+    print("Collecting Termux command data...")
+    commands_data = collector.collect_command_data()
+    
+    print("Collecting package data...")
+    packages_data = collector.collect_package_data()
+    
+    # Prepare training data
+    print("Preparing training data...")
+    inputs, targets = processor.prepare_training_data(commands_data, packages_data)
+    
+    # Training loop
+    print("Starting training...")
+    num_batches = len(inputs) // batch_size
+    
+    for epoch in range(epochs):
+        print(f"Epoch {epoch+1}/{epochs}")
+        
+        # Shuffle data
+        indices = np.random.permutation(len(inputs))
+        inputs = inputs[indices]
+        targets = targets[indices]
+        
+        total_loss = 0
+        
+        for batch in range(num_batches):
+            start_idx = batch * batch_size
+            end_idx = start_idx + batch_size
+            
+            batch_inputs = inputs[start_idx:end_idx]
+            batch_targets = targets[start_idx:end_idx]
+            
+            # Forward pass
+            logits = model(batch_inputs)
+            
+            # Calculate loss (cross-entropy)
+            loss = model.calculate_loss(logits, batch_targets)
+            total_loss += loss
+            
+            # Update model parameters (assuming the model has an update method)
+            model.update(loss)
+            
+            if batch % 10 == 0:
+                print(f"Batch {batch+1}/{num_batches}, Loss: {loss:.4f}")
+        
+        avg_loss = total_loss / num_batches
+        print(f"Epoch {epoch+1} completed. Average loss: {avg_loss:.4f}")
+        
+        # Save checkpoint
+        model_path = os.path.expanduser(f'~/.termux_llm/model_epoch_{epoch+1}.npz')
+        save_model(model, model_path)
+
+def main():
+    """Example usage of Termux training system."""
+    # Initialize model with custom config for Termux domain
+    config = ModelConfig(
+        vocab_size=5000,  # Smaller vocabulary for Termux domain
+        context_length=256,  # Shorter sequences for commands
+        embedding_dim=128,  # Smaller embeddings
+        num_layers=2,
+        num_heads=4,
+        dropout=0.1
+    )
+    
+    model = LightweightLLM(config)
+    
+    # Train model
+    train_on_termux_data(model, epochs=5, batch_size=16)
+    
+    # Example generation
+    prompt = "How do I install Python in Termux?"
+    prompt_tokens = model.tokenizer.encode(prompt)
+    
+    response_tokens = model.generate(
+        prompt_tokens,
+        max_new_tokens=100,
+        temperature=0.7
+    )
+    
+    response = model.tokenizer.decode(response_tokens)
+    print(f"\nPrompt: {prompt}")
+    print(f"Response: {response}")
+
+if __name__ == "__main__":
+    main()
